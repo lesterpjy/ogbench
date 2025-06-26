@@ -1,0 +1,24 @@
+#!/bin/bash
+#SBATCH --partition=gpu_a100
+#SBATCH --cpus-per-task=9
+#SBATCH --gpus=1
+#SBATCH --job-name=Test-run
+#SBATCH --ntasks=1
+#SBATCH --time=00:30:00
+#SBATCH --output=outfiles/test-runs_%A.out
+
+module purge
+module load 2023
+module load Anaconda3/2023.07-2
+
+source activate myenv
+
+cd ~/ogbench/impls/
+
+# Install critical dependencies directly with pip
+echo "Installing dependencies..."
+pip install -r requirements.txt
+
+export WANDB_API_KEY=be31cab88f3438c7d60f57a0592876832d77b55e
+
+python main.py --env_name=cube-single-play-v0 --train_steps=1000 --log_interval=100 --eval_interval=200 --save_interval=1000 --eval_episodes=5 --agent=agents/hiql.py --agent.high_alpha=3.0 --agent.low_alpha=3.0 --agent.subgoal_steps=10 --video_episodes=0
