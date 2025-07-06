@@ -160,8 +160,8 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
         info["high_critic_loss"] = high_critic_loss
 
         # --- Low-Level Critic Loss: L(Q_l) ---
-        # The logic is identical to the high-level critic, but with different inputs.
-        # The target for Q_l(s_t, z_t, a_t) is V(s_{t+1}, z_t), i.e., the value of the next state w.r.t the current subgoal.
+        # logic is identical to the high-level critic, but with different inputs.
+        # target for Q_l(s_t, z_t, a_t) is V(s_{t+1}, z_t), i.e., the value of the next state w.r.t the current subgoal.
         low_level_q_target_1, low_level_q_target_2 = self.network.select(
             "target_value"
         )(batch["next_observations"], batch["low_actor_goals"])
@@ -204,7 +204,7 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
         high_actor_dist = self.network.select("high_actor")(
             batch["observations"], batch["high_actor_goals"], params=grad_params
         )
-        # For a deterministic policy, we use the mode of the distribution (which is the mean for a Gaussian).
+        # for deterministic policy, use the mode of the distribution (mean for a Gaussian)
         pred_subgoal_reps = high_actor_dist.mode()
 
         # DDPG component: Maximize the Q-value of the action chosen by the policy.
@@ -241,6 +241,10 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
         # Get the subgoal representation for the low-level policy's context.
         subgoal_reps_low = self.network.select("goal_rep")(
             jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
+            # Pass grad_params to allow gradient flow
+            # from the low-level actor loss into the goal representation network (phi).
+            # This is controlled by the `low_actor_rep_grad` flag.
+            params=grad_params if self.config["low_actor_rep_grad"] else None,
         )
         # Get the deterministic primitive action from the low-level policy.
         low_actor_dist = self.network.select("low_actor")(
@@ -560,8 +564,8 @@ def get_config():
             "rep_dim": 10,
             "subgoal_steps": 25,
             # DDPG+BC parameters
-            "low_lambda": 0.1,  # Weight for Q-term in low-level actor loss
-            "high_lambda": 0.1,  # Weight for Q-term in high-level actor loss
+            "low_lambda": 1.0,  # Weight for Q-term in low-level actor loss
+            "high_lambda": 1.0,  # Weight for Q-term in high-level actor loss
             "value_loss_weight": 1.0,
             "critic_loss_weight": 1.0,
             "actor_loss_weight": 1.0,
