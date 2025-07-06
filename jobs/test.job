@@ -2,10 +2,10 @@
 #SBATCH --partition=gpu_a100
 #SBATCH --cpus-per-task=9
 #SBATCH --gpus=1
-#SBATCH --job-name=Test-run
+#SBATCH --job-name=HIQL_DDPGBC
 #SBATCH --ntasks=1
-#SBATCH --time=15:00:00
-#SBATCH --output=outfiles/hiql-visual-cube-single-play_%A.out
+#SBATCH --time=00:30:00
+#SBATCH --output=outfiles/hiql_ddpgbc-visual-cube-single-play_%A.out
 
 module purge
 module load 2023
@@ -23,4 +23,5 @@ export WANDB_API_KEY=
 
 export MUJOCO_GL=egl
 
-python main.py --env_name=visual-cube-single-play-v0 --train_steps=500000 --eval_episodes=50 --eval_on_cpu=0 --agent=agents/hiql.py --agent.batch_size=256 --agent.encoder=impala_small --agent.high_alpha=3.0 --agent.low_actor_rep_grad=True --agent.low_alpha=3.0 --agent.p_aug=0.5 --agent.subgoal_steps=10
+python main.py --env_name=visual-cube-single-play-v0 --train_steps=100000 --eval_episodes=10 --eval_on_cpu=0 --agent=agents/hiql_ddpgbc.py --agent.batch_size=256 --agent.encoder=impala_small --agent.high_lambda=1.0 --agent.low_actor_rep_grad=True --agent.low_lambda=1.0 --agent.p_aug=0.5 --agent.subgoal_steps=10
+

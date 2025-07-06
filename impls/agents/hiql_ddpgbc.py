@@ -504,15 +504,8 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
             value=(value_def, (ex_observations, ex_goals)),
             target_value=(target_value_def, (ex_observations, ex_goals)),
             # critic networks
+            high_critic=(high_critic_def, (ex_observations, ex_goals, ex_subgoal_reps)),
             low_critic=(low_critic_def, (ex_observations, ex_subgoal_reps, ex_actions)),
-            high_critic=(
-                high_critic_def,
-                (
-                    jnp.concatenate([ex_observations, ex_goals], axis=-1),
-                    None,
-                    ex_subgoal_reps,
-                ),
-            ),
             # actor networks
             low_actor=(
                 low_actor_def,
@@ -562,6 +555,7 @@ def get_config():
             "expectile": 0.7,  # IQL expectile for V-function
             # HIQL parameters
             "rep_dim": 10,
+            "low_actor_rep_grad": False,
             "subgoal_steps": 25,
             # DDPG+BC parameters
             "low_lambda": 1.0,  # Weight for Q-term in low-level actor loss
