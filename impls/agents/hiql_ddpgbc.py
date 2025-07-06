@@ -418,10 +418,12 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
             value_encoder_def = GCEncoder(
                 state_encoder=encoder_module(), concat_encoder=goal_rep_def
             )
+            target_value_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
         else:
             value_encoder_def = GCEncoder(
                 state_encoder=Identity(), concat_encoder=goal_rep_def
             )
+            target_value_encoder_def = GCEncoder(state_encoder=Identity(), concat_encoder=goal_rep_def)
 
         # `value_def` is the final V-function network, which includes the encoder and an MLP.
         # It's ensembled (two heads) for Clipped Double Q-Learning.
@@ -431,9 +433,12 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
             ensemble=True,
             gc_encoder=value_encoder_def,
         )
-        target_value_def = copy.deepcopy(
-            value_def
-        )  # Create a separate definition for the target network.
+        target_value_def = GCValue(
+            hidden_dims=config['value_hidden_dims'],
+            layer_norm=config['layer_norm'],
+            ensemble=True,
+            gc_encoder=target_value_encoder_def,
+        )
 
         # --- Q-function (Critic) Networks ---
         # Low-level critic Q_l(s, z, a)
