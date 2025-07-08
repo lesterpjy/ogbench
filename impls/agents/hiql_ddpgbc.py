@@ -214,8 +214,8 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
         )
         # Use the minimum of the two critics to get a conservative Q-estimate (Clipped Q-Learning).
         q_h = jnp.minimum(q_h_1, q_h_2)
-        # Maximizing Q is equivalent to minimizing -Q.
-        high_q_loss = -q_h.mean()
+        # Maximizing Q is equivalent to minimizing -Q, normalize to make it scale-invariant
+        high_q_loss = -q_h.mean() / jax.lax.stop_gradient(jnp.abs(q_h).mean() + 1e-6)
 
         # Behavioral Cloning (BC) component: Regularize the policy to stay close to the dataset "actions".
         # The target "action" for the high-level policy is the representation of the future state s_k.
@@ -235,6 +235,8 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
         info["high_actor_loss"] = high_actor_loss
         info["high_q_loss"] = high_q_loss
         info["high_bc_loss"] = high_bc_loss
+        info["high_mse"] = high_bc_loss
+        info["high_q_mean"] = q_h.mean()
 
         # --- Low-Level Actor Loss: J(mu_l) ---
         # The logic is identical, but for the low-level policy.
@@ -260,7 +262,7 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
             batch["observations"], subgoal_reps_low, pred_actions, goal_encoded=True
         )
         q_l = jnp.minimum(q_l_1, q_l_2)
-        low_q_loss = -q_l.mean()
+        low_q_loss = -q_l.mean() / jax.lax.stop_gradient(jnp.abs(q_l).mean() + 1e-6)
 
         # BC component: Regularize towards the primitive actions from the dataset.
         low_bc_loss = ((pred_actions - batch["actions"]) ** 2).mean()
@@ -270,6 +272,8 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
         info["low_actor_loss"] = low_actor_loss
         info["low_q_loss"] = low_q_loss
         info["low_bc_loss"] = low_bc_loss
+        info["low_mse"] = low_bc_loss
+        info["low_q_mean"] = q_l.mean()
 
         total_actor_loss = high_actor_loss + low_actor_loss
         return total_actor_loss, info
@@ -510,7 +514,12 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
             target_value=(target_value_def, (ex_observations, ex_goals)),
             # critic networks
             high_critic=(high_critic_def, (ex_observations, ex_goals, ex_subgoal_reps)),
-            low_critic=(low_critic_def, (ex_observations, ex_subgoal_reps, ex_actions)),
+            low_critic=(low_critic_def, {
+                'observations': ex_observations,
+                'goals': ex_subgoal_reps,
+                'actions': ex_actions,
+                'goal_encoded': True
+            }),
             # actor networks
             low_actor=(
                 low_actor_def,
