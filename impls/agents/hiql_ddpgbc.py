@@ -205,7 +205,6 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
             batch["observations"], batch["high_actor_goals"], params=grad_params
         )
         # for deterministic policy, use the mode of the distribution (mean for a Gaussian)
-        # pred_subgoal_reps = high_actor_dist.mode()
         if self.config['const_std']:
             pred_subgoal_reps = jnp.clip(high_actor_dist.mode(), -1, 1)
         else:
@@ -230,9 +229,6 @@ class HIQLDDPGBCAgent(flax.struct.PyTreeNode):
         )
         # We compute MSE between the policy's output and the target representation.
         # The target is a fixed label, so we stop gradients.
-        # high_bc_loss = (
-        #     (pred_subgoal_reps - jax.lax.stop_gradient(target_subgoal_reps)) ** 2
-        # ).mean()
         high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
         high_bc_loss = -(self.config['high_alpha'] * high_log_prob).mean()
 
@@ -590,8 +586,8 @@ def get_config():
             "low_actor_rep_grad": False,
             "subgoal_steps": 25,
             # DDPG+BC parameters
-            "low_alpha": 3.0,
-            "high_alpha": 3.0,
+            "low_alpha": 1.0,
+            "high_alpha": 1.0,
             "value_loss_weight": 1.0,
             "critic_loss_weight": 1.0,
             "actor_loss_weight": 1.0,
