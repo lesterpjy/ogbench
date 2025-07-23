@@ -224,8 +224,9 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         q_h_1, q_h_2 = self.network.select("high_critic")(
             batch["observations"], batch["high_actor_goals"], pred_subgoal_reps
         )
-        # Use the minimum of the two critics to get a conservative Q-estimate (Clipped Q-Learning).
+        # Use the minimum of the two critics to get a conservative Q-estimate
         q_h = jnp.minimum(q_h_1, q_h_2)
+        q_h = jax.lax.stop_gradient(q_h)
         # Maximizing Q is equivalent to minimizing -Q, normalize to make it scale-invariant
         high_q_loss = -q_h.mean() / jax.lax.stop_gradient(jnp.abs(q_h).mean() + 1e-6)
 
@@ -236,11 +237,9 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
                 [batch["observations"], batch["high_actor_targets"]], axis=-1
             )
         )
+        target_subgoal_reps = jax.lax.stop_gradient(target_subgoal_reps)
         # We compute MSE between the policy's output and the target representation.
         # The target is a fixed label, so we stop gradients.
-        # high_bc_loss = (
-        #     (pred_subgoal_reps - target_subgoal_reps) ** 2
-        # ).mean()
         high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
         high_bc_loss = -(self.config['high_alpha'] * high_log_prob).mean()
 
@@ -251,6 +250,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["high_bc_loss"] = high_bc_loss
         info["high_q_mean"] = q_h.mean()
         info["high_q_abs_mean"] = jnp.abs(q_h).mean()
+        info["high_bc_log_prob"] = high_log_prob.mean()
         info["high_mse"] = jnp.mean((pred_subgoal_reps - target_subgoal_reps) ** 2)
         info["high_std"] = jnp.mean(high_actor_dist.scale_diag)
 
@@ -259,11 +259,8 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         # Get the subgoal representation for the low-level policy's context.
         subgoal_reps_low = self.network.select("goal_rep")(
             jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
-            # Pass grad_params to allow gradient flow
-            # from the low-level actor loss into the goal representation network (phi).
-            # This is controlled by the `low_actor_rep_grad` flag.
-            params=grad_params if self.config["low_actor_rep_grad"] else None,
         )
+        subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
         # Get the deterministic primitive action from the low-level policy.
         low_actor_dist = self.network.select("low_actor")(
             batch["observations"],
@@ -282,6 +279,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
             batch["observations"], subgoal_reps_low, pred_actions, goal_encoded=True
         )
         q_l = jnp.minimum(q_l_1, q_l_2)
+        q_l = jax.lax.stop_gradient(q_l)
         low_q_loss = -q_l.mean() / jax.lax.stop_gradient(jnp.abs(q_l).mean() + 1e-6)
 
         # BC component: Regularize towards the primitive actions from the dataset.
@@ -296,6 +294,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["low_bc_loss"] = low_bc_loss
         info["low_q_mean"] = q_l.mean()
         info["low_q_abs_mean"] = jnp.abs(q_l).mean()
+        info["low_bc_log_prob"] = low_log_prob.mean()
         info["low_mse"] = jnp.mean((pred_actions - batch["actions"]) ** 2)
         info["low_std"] = jnp.mean(low_actor_dist.scale_diag)
 
@@ -303,7 +302,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         return total_actor_loss, info
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None):
+    def total_loss(self, batch, grad_params, rng=None, step=None):
         """Compute the total loss by combining all three phases."""
         info = {}
         # Get a new random key for this update step.
@@ -325,13 +324,35 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         for k, v in actor_info.items():
             info[f"actor/{k}"] = v
 
-        # Combine all losses into a single scalar for the optimizer.
-        # The weights allow tuning the relative importance of each component.
-        loss = (
-            self.config["value_loss_weight"] * value_loss
-            + self.config["critic_loss_weight"] * critic_loss
-            + self.config["actor_loss_weight"] * actor_loss
-        )
+        if self.config['loss_weight_warmup'] and step is not None:
+            # linear warmup
+            progress = jnp.minimum(1.0, step / self.config['warmup_steps'])
+            critic_weight = (
+                self.config['critic_loss_weight_init'] +
+                (self.config['critic_loss_weight'] - self.config['critic_loss_weight_init']) * progress
+            )
+            actor_weight = (
+                self.config['actor_loss_weight_init'] +
+                (self.config['actor_loss_weight'] - self.config['actor_loss_weight_init']) * progress
+            )
+
+            info['weights/critic_loss_weight'] = critic_weight
+            info['weights/actor_loss_weight'] = actor_weight
+            info['weights/warmup_progress'] = progress
+
+            # --- APPLY DYNAMIC WEIGHTS TO THE FINAL LOSS ---
+            loss = (
+                self.config["value_loss_weight"] * value_loss
+                + critic_weight * critic_loss
+                + actor_weight * actor_loss
+            )
+        else:
+            # static weights
+            loss = (
+                self.config["value_loss_weight"] * value_loss
+                + self.config["critic_loss_weight"] * critic_loss
+                + self.config["actor_loss_weight"] * actor_loss
+            )
         return loss, info
 
     def target_update(self, network, module_name):
@@ -357,8 +378,9 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
 
         # Define the function that computes the total loss.
         # `jax.grad` will differentiate this function with respect to its first argument (`grad_params`).
+        step = self.network.step
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng)
+            return self.total_loss(batch, grad_params, rng=rng, step=step)
 
         # `apply_loss_fn` is a helper that computes gradients and applies them.
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
@@ -381,22 +403,6 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         1. High-level policy mu_h(s, g) -> z (subgoal representation)
         2. Low-level policy mu_l(s, z) -> a (primitive action)
         """
-        # # High-level policy predicts a deterministic subgoal representation. `temperature` is ignored.
-        # high_dist = self.network.select("high_actor")(
-        #     observations, goals, temperature=1.0
-        # )
-        # goal_reps = high_dist.mode()
-
-        # # Low-level policy takes the state and the predicted subgoal representation to produce a primitive action.
-        # low_dist = self.network.select("low_actor")(
-        #     observations, goal_reps, goal_encoded=True, temperature=1.0
-        # )
-        # actions = low_dist.mode()
-
-        # # Clip actions to be within the valid range [-1, 1].
-        # if not self.config["discrete"]:
-        #     actions = jnp.clip(actions, -1, 1)
-        # return actions
         high_seed, low_seed = jax.random.split(seed)
 
         high_dist = self.network.select('high_actor')(observations, goals, temperature=temperature)
@@ -610,9 +616,21 @@ def get_config():
             # DDPG+BC parameters
             "low_alpha": 1.0,  # Weight for Q-term in low-level actor loss
             "high_alpha": 1.0,  # Weight for Q-term in high-level actor loss
-            "value_loss_weight": 1.0,
-            "critic_loss_weight": 1.0,
-            "actor_loss_weight": 1.0,
+            # static weights
+            # "value_loss_weight": 10.0,
+            # "critic_loss_weight": 0.2,
+            # "actor_loss_weight": 0.2,
+            # --- WARM-UP weights ---
+            "loss_weight_warmup": False,
+            "value_loss_weight": 1.0,  # Keep value loss weight constant
+            "warmup_steps": 10000,     # Duration of the warm-up in training steps
+
+            "critic_loss_weight_init": 0.05, # Start critic loss at weight 0
+            "critic_loss_weight": 1.0,   # End critic loss at weight 1.0
+
+            "actor_loss_weight_init": 0.05,  # Start actor loss at weight 0
+            "actor_loss_weight": 1.0,    # End actor loss at weight 1.0
+
             # Other flags
             "discrete": False,
             "const_std": True,  # For deterministic policy in GCActor
