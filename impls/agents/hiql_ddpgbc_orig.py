@@ -250,9 +250,11 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         )
         # for deterministic policy, use the mode of the distribution (mean for a Gaussian)
         if self.config['const_std']:
-            pred_subgoal_reps = jnp.clip(high_actor_dist.mode(), -1, 1)
+            pred_subgoal_reps = high_actor_dist.mode()
         else:
-            pred_subgoal_reps = jnp.clip(high_actor_dist.sample(seed=high_actor_rng), -1, 1)
+            pred_subgoal_reps = high_actor_dist.sample(seed=high_actor_rng)
+        # Normalize to match the target distribution
+        pred_subgoal_reps = pred_subgoal_reps / jnp.linalg.norm(pred_subgoal_reps, axis=-1, keepdims=True) * jnp.sqrt(self.config['rep_dim'])
 
         # DDPG component: Maximize the Q-value of the action chosen by the policy.
         # We evaluate the predicted subgoal representation using the high-level critic.
@@ -261,7 +263,6 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         )
         # Use the minimum of the two critics to get a conservative Q-estimate
         q_h = jnp.minimum(q_h_1, q_h_2)
-        q_h = jax.lax.stop_gradient(q_h)
         # Maximizing Q is equivalent to minimizing -Q, normalize to make it scale-invariant
         high_q_loss = -q_h.mean() / jax.lax.stop_gradient(jnp.abs(q_h).mean() + 1e-6)
 
@@ -270,10 +271,9 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         target_subgoal_reps = self.network.select("goal_rep")(
             jnp.concatenate(
                 [batch["observations"], batch["high_actor_targets"]], axis=-1
-            ),
-            params=grad_params
+            )
         )
-        # target_subgoal_reps = jax.lax.stop_gradient(target_subgoal_reps)
+        target_subgoal_reps = jax.lax.stop_gradient(target_subgoal_reps)
         # We compute MSE between the policy's output and the target representation.
         # The target is a fixed label, so we stop gradients.
         high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
@@ -287,8 +287,8 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["high_q_mean"] = q_h.mean()
         info["high_q_abs_mean"] = jnp.abs(q_h).mean()
         info["high_bc_log_prob"] = high_log_prob.mean()
-        info["high_mse"] = jnp.mean((pred_subgoal_reps - jax.lax.stop_gradient(target_subgoal_reps)) ** 2)
-        info["high_target_rep_norm"] = jnp.linalg.norm(jax.lax.stop_gradient(target_subgoal_reps), axis=-1).mean()
+        info["high_mse"] = jnp.mean((pred_subgoal_reps - target_subgoal_reps) ** 2)
+        info["high_target_rep_norm"] = jnp.linalg.norm(target_subgoal_reps, axis=-1).mean()
         info["high_pred_rep_norm"] = jnp.linalg.norm(pred_subgoal_reps, axis=-1).mean()
         info["high_std"] = jnp.mean(high_actor_dist.scale_diag)
         
@@ -318,10 +318,9 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
 
         # DDPG component: Evaluate the predicted action with the low-level critic.
         q_l_1, q_l_2 = self.network.select("low_critic")(
-            batch["observations"], jax.lax.stop_gradient(subgoal_reps_low), pred_actions, goal_encoded=True
+            batch["observations"], subgoal_reps_low, pred_actions, goal_encoded=True
         )
         q_l = jnp.minimum(q_l_1, q_l_2)
-        q_l = jax.lax.stop_gradient(q_l)
         low_q_loss = -q_l.mean() / jax.lax.stop_gradient(jnp.abs(q_l).mean() + 1e-6)
 
         # BC component: Regularize towards the primitive actions from the dataset.
@@ -650,7 +649,7 @@ def get_config():
             # RL parameters
             "discount": 0.99,
             "tau": 0.005,  # Target network update rate for V-function
-            "expectile": 0.7,  # IQL expectile for V-function
+            "expectile": 0.6,  # IQL expectile for V-function
             # HIQL parameters
             "rep_dim": 10,
             "low_actor_rep_grad": False,
