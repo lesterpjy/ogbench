@@ -649,7 +649,7 @@ def get_config():
             # RL parameters
             "discount": 0.99,
             "tau": 0.005,  # Target network update rate for V-function
-            "expectile": 0.6,  # IQL expectile for V-function
+            "expectile": 0.7,  # IQL expectile for V-function
             # HIQL parameters
             "rep_dim": 10,
             "low_actor_rep_grad": False,
