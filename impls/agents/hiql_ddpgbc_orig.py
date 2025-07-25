@@ -123,35 +123,16 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info = {}
 
         # --- High-Level Critic Loss: L(Q_h) ---
-        # The high-level goal is the final goal. Success is reaching it.
-        if self.config['encoder'] is not None:
-            # Pixel-based environment: Success is based on L2 distance.
-            # Observations are normalized to [0, 1], so distance is also in a normalized space.
-            img_shape = batch['high_actor_targets'].shape
-            high_dist = jnp.linalg.norm(
-                jnp.reshape(batch['high_actor_targets'], (img_shape[0], -1)) -
-                jnp.reshape(batch['high_actor_goals'], (img_shape[0], -1)),
-                axis=-1
-            )
-            high_successes = (high_dist < self.config['pixel_success_threshold']).astype(jnp.float32)
-        else:
-            # State-based environment: Success is based on exact match.
-            high_successes = (batch['high_actor_targets'] == batch['high_actor_goals']).all(axis=-1).astype(jnp.float32)
-
-        high_rewards = high_successes - (1.0 if self.config['gc_negative'] else 0.0)
-        high_masks = 1.0 - high_successes
-
         # The target value for the high-level critic Q_h(s, g, z) is V(s_k, g),
         # where s_k is the k-step future state, representing the achieved subgoal.
         # We use the target V-network for stability.
-        high_level_next_v_1, high_level_next_v_2 = self.network.select(
+        high_level_q_target_1, high_level_q_target_2 = self.network.select(
             "target_value"
         )(batch["high_actor_targets"], batch["high_actor_goals"])
         # We still use clipping for the target value to be conservative.
-        high_level_next_v = jnp.minimum(high_level_next_v_1, high_level_next_v_2)
+        high_level_q_target = jnp.minimum(high_level_q_target_1, high_level_q_target_2)
         # CRITICAL: Stop gradients here. We treat V(s_k, g) as a fixed label.
         # The error in the Q-function should not change the V-function.
-        high_level_q_target = high_rewards + self.config["discount"] * high_masks * high_level_next_v
         high_level_q_target = jax.lax.stop_gradient(high_level_q_target)
 
         # The "action" for the high-level critic is the subgoal representation z = phi(s_k).
@@ -182,37 +163,20 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["high_q_min"] = high_level_q_target.min()
 
         # --- Low-Level Critic Loss: L(Q_l) ---
-        # The low-level goal is the subgoal. Success is reaching it in the next step.
-        if self.config['encoder'] is not None:
-            # Pixel-based environment
-            img_shape = batch['next_observations'].shape
-            low_dist = jnp.linalg.norm(
-                jnp.reshape(batch['next_observations'], (img_shape[0], -1)) -
-                jnp.reshape(batch['low_actor_goals'], (img_shape[0], -1)),
-                axis=-1
-            )
-            low_successes = (low_dist < self.config['pixel_success_threshold']).astype(jnp.float32)
-        else:
-            # State-based environment
-            low_successes = (batch['next_observations'] == batch['low_actor_goals']).all(axis=-1).astype(jnp.float32)
-        low_rewards = low_successes - (1.0 if self.config['gc_negative'] else 0.0)
-        low_masks = 1.0 - low_successes
-
-        # logic is identical to the high-level critic, but with different inputs.
-        # target for Q_l(s_t, z_t, a_t) is V(s_{t+1}, z_t), i.e., the value of the next state w.r.t the current subgoal.
-        low_level_next_v_1, low_level_next_v_2 = self.network.select(
-            "target_value"
-        )(batch["next_observations"], batch["low_actor_goals"])
-        low_level_next_v = jnp.minimum(low_level_next_v_1, low_level_next_v_2)
-        low_level_q_target = low_rewards + self.config["discount"] * low_masks * low_level_next_v
-        low_level_q_target = jax.lax.stop_gradient(low_level_q_target)
-
         # The "action" is the primitive action `a_t` from the dataset.
         # The subgoal `z_t` is part of the state/context for the low-level critic.
         subgoal_reps_low = self.network.select("goal_rep")(
             jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
         )
-        subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
+        # subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
+
+        # target for Q_l(s_t, z_t, a_t) is V(s_{t+1}, z_t), i.e., the value of the next state w.r.t the current subgoal.
+        low_level_q_target_1, low_level_q_target_2 = self.network.select(
+            "target_value"
+        )(batch["next_observations"], subgoal_reps_low, goal_encoded=True)
+        low_level_q_target = jnp.minimum(low_level_q_target_1, low_level_q_target_2)
+        low_level_q_target = jax.lax.stop_gradient(low_level_q_target)
+
         # Predict Q_l.
         q_l_pred_1, q_l_pred_2 = self.network.select("low_critic")(
             batch["observations"],
@@ -312,9 +276,12 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         )
         # pred_actions = low_actor_dist.mode()
         if self.config['const_std']:
-            pred_actions = jnp.clip(low_actor_dist.mode(), -1, 1)
+            pred_actions = low_actor_dist.mode()
         else:
-            pred_actions = jnp.clip(low_actor_dist.sample(seed=low_actor_rng), -1, 1)
+            pred_actions = low_actor_dist.sample(seed=low_actor_rng)
+
+        if not self.config['discrete']:
+            pred_actions = jnp.clip(pred_actions, -1, 1)
 
         # DDPG component: Evaluate the predicted action with the low-level critic.
         q_l_1, q_l_2 = self.network.select("low_critic")(
@@ -688,7 +655,6 @@ def get_config():
             "gc_negative": True,
             "p_aug": 0.0,
             "frame_stack": ml_collections.config_dict.placeholder(int),
-            "pixel_success_threshold": 0.5,
         }
     )
     return config
