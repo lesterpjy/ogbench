@@ -118,66 +118,85 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
     def critic_loss(self, batch, grad_params):
         """
         Phase 2: Learn Q-functions (critics) from the learned V-function via supervised regression.
-        The goal is to make Q(s,a,g) predict V(s',g).
+        
+        The high-level critic Q_h(s, g, z) should predict:
+            sum_{i=0}^{k-1} gamma^i * r(s_{t+i}, g) + gamma^k * V(s_k, g)
+        
+        The low-level critic Q_l(s, z, a) should predict:
+            r(s_t, z_t) + gamma * V(s_{t+1}, z_t)
         """
         info = {}
 
         # --- High-Level Critic Loss: L(Q_h) ---
-        # The target value for the high-level critic Q_h(s, g, z) is V(s_k, g),
-        # where s_k is the k-step future state, representing the achieved subgoal.
-        # We use the target V-network for stability.
-        high_level_q_target_1, high_level_q_target_2 = self.network.select(
+        # The target for Q_h(s, g, z) includes:
+        # 1. The k-step cumulative discounted reward from s to s_k
+        # 2. The discounted value at s_k
+        
+        # Get V(s_k, g) from the target value network
+        high_level_v_target_1, high_level_v_target_2 = self.network.select(
             "target_value"
         )(batch["high_actor_targets"], batch["high_actor_goals"])
-        # We still use clipping for the target value to be conservative.
-        high_level_q_target = jnp.minimum(high_level_q_target_1, high_level_q_target_2)
-        # CRITICAL: Stop gradients here. We treat V(s_k, g) as a fixed label.
-        # The error in the Q-function should not change the V-function.
+        # Use the minimum for a conservative estimate
+        high_level_v_target = jnp.minimum(high_level_v_target_1, high_level_v_target_2)
+        
+        # Compute the full target: k-step reward + gamma^k * V(s_k, g)
+        # Use mask to handle terminal states (when s_k == g)
+        k_steps = batch["high_k_steps"]
+        gamma_k = self.config["discount"] ** k_steps
+        high_level_q_target = batch["high_k_step_rewards"] + gamma_k * batch["high_masks"] * high_level_v_target
+        
+        # Stop gradients - we treat this as a fixed regression target
         high_level_q_target = jax.lax.stop_gradient(high_level_q_target)
 
-        # The "action" for the high-level critic is the subgoal representation z = phi(s_k).
-        # We get this by passing the subgoal state s_k through the representation function.
+        # The "action" for the high-level critic is the subgoal representation z = phi(s_k)
         subgoal_reps = self.network.select("goal_rep")(
             jnp.concatenate(
                 [batch["observations"], batch["high_actor_targets"]], axis=-1
             )
         )
-        # Stop gradients as this is part of the "target" action.
         subgoal_reps = jax.lax.stop_gradient(subgoal_reps)
 
-        # Predict Q_h for the given state, goal, and subgoal representation.
+        # Predict Q_h(s, g, z)
         q_h_pred_1, q_h_pred_2 = self.network.select("high_critic")(
             batch["observations"],
             batch["high_actor_goals"],
             subgoal_reps,
             params=grad_params,
         )
-        # The loss is simple Mean-Squared-Error, as we're doing supervised regression.
+        
+        # MSE loss for regression
         high_critic_loss = (
             (q_h_pred_1 - high_level_q_target) ** 2
             + (q_h_pred_2 - high_level_q_target) ** 2
         ).mean()
+        
         info["high_critic_loss"] = high_critic_loss
         info["high_q_mean"] = high_level_q_target.mean()
         info["high_q_max"] = high_level_q_target.max()
         info["high_q_min"] = high_level_q_target.min()
 
         # --- Low-Level Critic Loss: L(Q_l) ---
-        # The "action" is the primitive action `a_t` from the dataset.
-        # The subgoal `z_t` is part of the state/context for the low-level critic.
+        # The target for Q_l(s_t, z_t, a_t) is:
+        # r(s_t, z_t) + gamma * V(s_{t+1}, z_t)
+        
+        # Get the subgoal representation for the low-level context
         subgoal_reps_low = self.network.select("goal_rep")(
             jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
         )
         subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
 
-        # target for Q_l(s_t, z_t, a_t) is V(s_{t+1}, z_t), i.e., the value of the next state w.r.t the current subgoal.
-        low_level_q_target_1, low_level_q_target_2 = self.network.select(
+        # Get V(s_{t+1}, z_t) from the target value network
+        low_level_v_target_1, low_level_v_target_2 = self.network.select(
             "target_value"
         )(batch["next_observations"], subgoal_reps_low, goal_encoded=True)
-        low_level_q_target = jnp.minimum(low_level_q_target_1, low_level_q_target_2)
+        low_level_v_target = jnp.minimum(low_level_v_target_1, low_level_v_target_2)
+        
+        # Compute the full target: r(s_t, z_t) + gamma * V(s_{t+1}, z_t)
+        # Use mask to handle terminal states (when s_{t+1} == z_t)
+        low_level_q_target = batch["low_rewards"] + self.config["discount"] * batch["low_masks"] * low_level_v_target
         low_level_q_target = jax.lax.stop_gradient(low_level_q_target)
 
-        # Predict Q_l.
+        # Predict Q_l(s_t, z_t, a_t)
         q_l_pred_1, q_l_pred_2 = self.network.select("low_critic")(
             batch["observations"],
             subgoal_reps_low,
@@ -185,17 +204,19 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
             goal_encoded=True,
             params=grad_params,
         )
-        # Compute MSE loss.
+        
+        # MSE loss for regression
         low_critic_loss = (
             (q_l_pred_1 - low_level_q_target) ** 2
             + (q_l_pred_2 - low_level_q_target) ** 2
         ).mean()
+        
         info["low_critic_loss"] = low_critic_loss
         info["low_q_mean"] = low_level_q_target.mean()
         info["low_q_max"] = low_level_q_target.max()
         info["low_q_min"] = low_level_q_target.min()
 
-        # The total critic loss is the sum of both.
+        # Total critic loss
         total_critic_loss = high_critic_loss + low_critic_loss
         return total_critic_loss, info
 
@@ -240,9 +261,8 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         target_subgoal_reps = jax.lax.stop_gradient(target_subgoal_reps)
         # We compute MSE between the policy's output and the target representation.
         # The target is a fixed label, so we stop gradients.
-        # high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
-        # high_bc_loss = -(self.config['high_alpha'] * high_log_prob).mean()
-        high_bc_loss = self.config['high_alpha'] * ((pred_subgoal_reps - target_subgoal_reps) ** 2).mean()
+        high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
+        high_bc_loss = -(self.config['high_alpha'] * high_log_prob).mean()
 
         # The final actor loss is a weighted sum of the DDPG and BC components.
         high_actor_loss = high_q_loss + high_bc_loss
@@ -251,7 +271,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["high_bc_loss"] = high_bc_loss
         info["high_q_mean"] = q_h.mean()
         info["high_q_abs_mean"] = jnp.abs(q_h).mean()
-        # info["high_bc_log_prob"] = high_log_prob.mean()
+        info["high_bc_log_prob"] = high_log_prob.mean()
         info["high_mse"] = jnp.mean((pred_subgoal_reps - target_subgoal_reps) ** 2)
         info["high_target_rep_norm"] = jnp.linalg.norm(target_subgoal_reps, axis=-1).mean()
         info["high_pred_rep_norm"] = jnp.linalg.norm(pred_subgoal_reps, axis=-1).mean()
@@ -293,9 +313,8 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
 
         # BC component: Regularize towards the primitive actions from the dataset.
         # low_bc_loss = ((pred_actions - batch["actions"]) ** 2).mean()
-        # low_log_prob = low_actor_dist.log_prob(batch["actions"])
-        # low_bc_loss = -(self.config['low_alpha'] * low_log_prob).mean()
-        low_bc_loss = self.config['low_alpha'] * ((pred_actions - batch["actions"]) ** 2).mean()
+        low_log_prob = low_actor_dist.log_prob(batch["actions"])
+        low_bc_loss = -(self.config['low_alpha'] * low_log_prob).mean()
 
         # Combine the losses.
         low_actor_loss = low_q_loss + low_bc_loss
@@ -304,7 +323,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["low_bc_loss"] = low_bc_loss
         info["low_q_mean"] = q_l.mean()
         info["low_q_abs_mean"] = jnp.abs(q_l).mean()
-        # info["low_bc_log_prob"] = low_log_prob.mean()
+        info["low_bc_log_prob"] = low_log_prob.mean()
         info["low_mse"] = jnp.mean((pred_actions - batch["actions"]) ** 2)
         info["low_std"] = jnp.mean(low_actor_dist.scale_diag)
 
