@@ -168,7 +168,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         subgoal_reps_low = self.network.select("goal_rep")(
             jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
         )
-        # subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
+        subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
 
         # target for Q_l(s_t, z_t, a_t) is V(s_{t+1}, z_t), i.e., the value of the next state w.r.t the current subgoal.
         low_level_q_target_1, low_level_q_target_2 = self.network.select(
@@ -240,8 +240,9 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         target_subgoal_reps = jax.lax.stop_gradient(target_subgoal_reps)
         # We compute MSE between the policy's output and the target representation.
         # The target is a fixed label, so we stop gradients.
-        high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
-        high_bc_loss = -(self.config['high_alpha'] * high_log_prob).mean()
+        # high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
+        # high_bc_loss = -(self.config['high_alpha'] * high_log_prob).mean()
+        high_bc_loss = self.config['high_alpha'] * ((pred_subgoal_reps - target_subgoal_reps) ** 2).mean()
 
         # The final actor loss is a weighted sum of the DDPG and BC components.
         high_actor_loss = high_q_loss + high_bc_loss
@@ -250,7 +251,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["high_bc_loss"] = high_bc_loss
         info["high_q_mean"] = q_h.mean()
         info["high_q_abs_mean"] = jnp.abs(q_h).mean()
-        info["high_bc_log_prob"] = high_log_prob.mean()
+        # info["high_bc_log_prob"] = high_log_prob.mean()
         info["high_mse"] = jnp.mean((pred_subgoal_reps - target_subgoal_reps) ** 2)
         info["high_target_rep_norm"] = jnp.linalg.norm(target_subgoal_reps, axis=-1).mean()
         info["high_pred_rep_norm"] = jnp.linalg.norm(pred_subgoal_reps, axis=-1).mean()
@@ -292,8 +293,9 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
 
         # BC component: Regularize towards the primitive actions from the dataset.
         # low_bc_loss = ((pred_actions - batch["actions"]) ** 2).mean()
-        low_log_prob = low_actor_dist.log_prob(batch["actions"])
-        low_bc_loss = -(self.config['low_alpha'] * low_log_prob).mean()
+        # low_log_prob = low_actor_dist.log_prob(batch["actions"])
+        # low_bc_loss = -(self.config['low_alpha'] * low_log_prob).mean()
+        low_bc_loss = self.config['low_alpha'] * ((pred_actions - batch["actions"]) ** 2).mean()
 
         # Combine the losses.
         low_actor_loss = low_q_loss + low_bc_loss
@@ -302,7 +304,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["low_bc_loss"] = low_bc_loss
         info["low_q_mean"] = q_l.mean()
         info["low_q_abs_mean"] = jnp.abs(q_l).mean()
-        info["low_bc_log_prob"] = low_log_prob.mean()
+        # info["low_bc_log_prob"] = low_log_prob.mean()
         info["low_mse"] = jnp.mean((pred_actions - batch["actions"]) ** 2)
         info["low_std"] = jnp.mean(low_actor_dist.scale_diag)
 
