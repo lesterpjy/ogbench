@@ -22,9 +22,6 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         - Q_h(s, g, z): High-level critic for choosing a subgoal representation 'z'.
         - Q_l(s, z, a): Low-level critic for choosing a primitive action 'a' to reach subgoal 'z'.
     3.  Extract deterministic policies mu_h and mu_l using a DDPG+BC objective, which uses the learned Q-functions.
-
-    All phases are trained end-to-end in a single update step, with gradients carefully controlled
-    using jax.lax.stop_gradient to maintain the logic of the phased approach.
     """
 
     rng: Any
@@ -134,7 +131,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         
         # Get V(s_k, g) from the target value network
         high_level_v_target_1, high_level_v_target_2 = self.network.select(
-            "target_value"
+            "value"
         )(batch["high_actor_targets"], batch["high_actor_goals"])
         # Use the minimum for a conservative estimate
         high_level_v_target = jnp.minimum(high_level_v_target_1, high_level_v_target_2)
@@ -144,9 +141,6 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         k_steps = batch["high_k_steps"]
         gamma_k = self.config["discount"] ** k_steps
         high_level_q_target = batch["high_k_step_rewards"] + gamma_k * batch["high_masks"] * high_level_v_target
-        
-        # Stop gradients - we treat this as a fixed regression target
-        high_level_q_target = jax.lax.stop_gradient(high_level_q_target)
 
         # The "action" for the high-level critic is the subgoal representation z = phi(s_k)
         subgoal_reps = self.network.select("goal_rep")(
@@ -154,7 +148,6 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
                 [batch["observations"], batch["high_actor_targets"]], axis=-1
             )
         )
-        subgoal_reps = jax.lax.stop_gradient(subgoal_reps)
 
         # Predict Q_h(s, g, z)
         q_h_pred_1, q_h_pred_2 = self.network.select("high_critic")(
@@ -183,18 +176,16 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         subgoal_reps_low = self.network.select("goal_rep")(
             jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
         )
-        subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
 
         # Get V(s_{t+1}, z_t) from the target value network
         low_level_v_target_1, low_level_v_target_2 = self.network.select(
-            "target_value"
-        )(batch["next_observations"], subgoal_reps_low, goal_encoded=True)
+            "value"
+        )(batch["next_observations"], batch["low_actor_goals"])
         low_level_v_target = jnp.minimum(low_level_v_target_1, low_level_v_target_2)
         
         # Compute the full target: r(s_t, z_t) + gamma * V(s_{t+1}, z_t)
         # Use mask to handle terminal states (when s_{t+1} == z_t)
         low_level_q_target = batch["low_rewards"] + self.config["discount"] * batch["low_masks"] * low_level_v_target
-        low_level_q_target = jax.lax.stop_gradient(low_level_q_target)
 
         # Predict Q_l(s_t, z_t, a_t)
         q_l_pred_1, q_l_pred_2 = self.network.select("low_critic")(
@@ -239,7 +230,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         else:
             pred_subgoal_reps = high_actor_dist.sample(seed=high_actor_rng)
         # Normalize to match the target distribution
-        pred_subgoal_reps = pred_subgoal_reps / jnp.linalg.norm(pred_subgoal_reps, axis=-1, keepdims=True) * jnp.sqrt(self.config['rep_dim'])
+        pred_subgoal_reps = pred_subgoal_reps / jnp.linalg.norm(pred_subgoal_reps, axis=-1, keepdims=True) * jnp.sqrt(pred_subgoal_reps.shape[-1])
 
         # DDPG component: Maximize the Q-value of the action chosen by the policy.
         # We evaluate the predicted subgoal representation using the high-level critic.
@@ -258,7 +249,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
                 [batch["observations"], batch["high_actor_targets"]], axis=-1
             )
         )
-        target_subgoal_reps = jax.lax.stop_gradient(target_subgoal_reps)
+
         # We compute MSE between the policy's output and the target representation.
         # The target is a fixed label, so we stop gradients.
         high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
@@ -283,11 +274,8 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         # Get the subgoal representation for the low-level policy's context.
         subgoal_reps_low = self.network.select("goal_rep")(
             jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
-            params=grad_params
         )
-        if not self.config['low_actor_rep_grad']:
-            # Stop gradients through the goal representations.
-            subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
+
         # Get the deterministic primitive action from the low-level policy.
         low_actor_dist = self.network.select("low_actor")(
             batch["observations"],
@@ -312,7 +300,6 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         low_q_loss = -q_l.mean() / jax.lax.stop_gradient(jnp.abs(q_l).mean() + 1e-6)
 
         # BC component: Regularize towards the primitive actions from the dataset.
-        # low_bc_loss = ((pred_actions - batch["actions"]) ** 2).mean()
         low_log_prob = low_actor_dist.log_prob(batch["actions"])
         low_bc_loss = -(self.config['low_alpha'] * low_log_prob).mean()
 
@@ -475,17 +462,14 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
             goal_rep_seq = [encoder_module()]
         else:
             goal_rep_seq = []
-        # It's followed by an MLP and a normalization layer.
-        goal_rep_seq.extend(
-            [
-                MLP(
-                    hidden_dims=(*config["value_hidden_dims"], config["rep_dim"]),
-                    activate_final=False,
-                    layer_norm=config["layer_norm"],
-                ),
-                LengthNormalize(),
-            ]
+        goal_rep_seq.append(
+            MLP(
+                hidden_dims=(*config['value_hidden_dims'], config['rep_dim']),
+                activate_final=False,
+                layer_norm=config['layer_norm'],
+            )
         )
+        goal_rep_seq.append(LengthNormalize())
         goal_rep_def = nn.Sequential(goal_rep_seq)
 
         # `value_encoder_def` defines how inputs are processed before the value MLP.
@@ -555,7 +539,8 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         low_actor_def = GCActor(
             hidden_dims=config["actor_hidden_dims"],
             action_dim=action_dim,
-            const_std=True,
+            state_dependent_std=False,
+            const_std=config['const_std'],
             gc_encoder=low_actor_encoder_def,
         )
 
@@ -569,7 +554,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         high_actor_def = GCActor(
             hidden_dims=config["actor_hidden_dims"],
             action_dim=config["rep_dim"],
-            const_std=True,
+            const_std=config['const_std'],
             gc_encoder=high_actor_encoder_def,
         )
 
@@ -629,9 +614,9 @@ def get_config():
             "lr": 3e-4,
             "batch_size": 1024,
             # Network architectures
-            "actor_hidden_dims": (256, 256),
-            "value_hidden_dims": (256, 256),
-            "critic_hidden_dims": (256, 256),
+            "actor_hidden_dims": (512, 512, 512),
+            "value_hidden_dims": (512, 512, 512),
+            "critic_hidden_dims": (512, 512, 512),
             "layer_norm": True,
             "encoder": ml_collections.config_dict.placeholder(str),
             # RL parameters
@@ -643,8 +628,8 @@ def get_config():
             "low_actor_rep_grad": False,
             "subgoal_steps": 25,
             # DDPG+BC parameters
-            "low_alpha": 1.0,  # Weight for Q-term in low-level actor loss
-            "high_alpha": 1.0,  # Weight for Q-term in high-level actor loss
+            "low_alpha": 5.0,  # Weight for Q-term in low-level actor loss
+            "high_alpha": 10.0,  # Weight for Q-term in high-level actor loss
             # static weights
             # "value_loss_weight": 10.0,
             # "critic_loss_weight": 0.2,
