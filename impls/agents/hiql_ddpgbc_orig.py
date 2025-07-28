@@ -262,6 +262,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["high_bc_loss"] = high_bc_loss
         info["high_q_mean"] = q_h.mean()
         info["high_q_abs_mean"] = jnp.abs(q_h).mean()
+        info["high_q_std"] = jnp.std(q_h)
         info["high_bc_log_prob"] = high_log_prob.mean()
         info["high_mse"] = jnp.mean((pred_subgoal_reps - target_subgoal_reps) ** 2)
         info["high_target_rep_norm"] = jnp.linalg.norm(target_subgoal_reps, axis=-1).mean()
@@ -274,8 +275,11 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         # Get the subgoal representation for the low-level policy's context.
         subgoal_reps_low = self.network.select("goal_rep")(
             jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
+            params=grad_params,
         )
-
+        if not self.config['low_actor_rep_grad']:
+            # Stop gradients through the goal representations.
+            subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
         # Get the deterministic primitive action from the low-level policy.
         low_actor_dist = self.network.select("low_actor")(
             batch["observations"],
@@ -294,7 +298,10 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
 
         # DDPG component: Evaluate the predicted action with the low-level critic.
         q_l_1, q_l_2 = self.network.select("low_critic")(
-            batch["observations"], subgoal_reps_low, pred_actions, goal_encoded=True
+            batch["observations"], 
+            jax.lax.stop_gradient(subgoal_reps_low),
+            pred_actions,
+            goal_encoded=True
         )
         q_l = jnp.minimum(q_l_1, q_l_2)
         low_q_loss = -q_l.mean() / jax.lax.stop_gradient(jnp.abs(q_l).mean() + 1e-6)
@@ -310,6 +317,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         info["low_bc_loss"] = low_bc_loss
         info["low_q_mean"] = q_l.mean()
         info["low_q_abs_mean"] = jnp.abs(q_l).mean()
+        info["low_q_std"] = jnp.std(q_l)
         info["low_bc_log_prob"] = low_log_prob.mean()
         info["low_mse"] = jnp.mean((pred_actions - batch["actions"]) ** 2)
         info["low_std"] = jnp.mean(low_actor_dist.scale_diag)
@@ -532,9 +540,9 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         # Define low-level actor mu_l(s, z).
         # Inputs: s, z (subgoal rep)
         if config["encoder"] is not None:
-            low_actor_encoder_def = GCEncoder(state_encoder=encoder_module())
+            low_actor_encoder_def = GCEncoder(state_encoder=encoder_module(), concat_encoder=goal_rep_def)
         else:
-            low_actor_encoder_def = GCEncoder(state_encoder=Identity())
+            low_actor_encoder_def = GCEncoder(state_encoder=Identity(), concat_encoder=goal_rep_def)
         # `const_std=True` makes the GCActor output a deterministic mean.
         low_actor_def = GCActor(
             hidden_dims=config["actor_hidden_dims"],
@@ -628,8 +636,8 @@ def get_config():
             "low_actor_rep_grad": False,
             "subgoal_steps": 25,
             # DDPG+BC parameters
-            "low_alpha": 5.0,  # Weight for Q-term in low-level actor loss
-            "high_alpha": 10.0,  # Weight for Q-term in high-level actor loss
+            "low_alpha": 3.0,  # Weight for Q-term in low-level actor loss
+            "high_alpha": 3.0,  # Weight for Q-term in high-level actor loss
             # static weights
             # "value_loss_weight": 10.0,
             # "critic_loss_weight": 0.2,

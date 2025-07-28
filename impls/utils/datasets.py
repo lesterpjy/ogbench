@@ -418,6 +418,10 @@ class HGCDataset(GCDataset):
         high_successes_at_k = (high_target_idxs == high_goal_idxs).astype(float)
         batch['high_masks'] = 1.0 - high_successes_at_k
 
+        assert np.all(batch['high_k_steps'] >= 0)
+        assert np.all(batch['high_k_steps'] <= self.config['subgoal_steps'])
+        assert np.isfinite(batch['high_k_step_rewards']).all()
+
         if self.config['p_aug'] is not None and not evaluation:
             if np.random.rand() < self.config['p_aug']:
                 self.augment(
