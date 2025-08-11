@@ -29,7 +29,7 @@ flags.DEFINE_integer('restore_epoch', None, 'Restore epoch.')
 flags.DEFINE_integer('train_steps', 1000000, 'Number of training steps.')
 flags.DEFINE_integer('log_interval', 5000, 'Logging interval.')
 flags.DEFINE_integer('eval_interval', 100000, 'Evaluation interval.')
-flags.DEFINE_integer('save_interval', 1000000, 'Saving interval.')
+flags.DEFINE_integer('save_interval', 500000, 'Saving interval.')
 
 flags.DEFINE_integer('eval_tasks', None, 'Number of tasks to evaluate (None for all).')
 flags.DEFINE_integer('eval_episodes', 20, 'Number of episodes for each task.')
@@ -41,6 +41,27 @@ flags.DEFINE_integer('eval_on_cpu', 1, 'Whether to evaluate on CPU.')
 
 config_flags.DEFINE_config_file('agent', 'agents/gciql.py', lock_config=False)
 
+def debug_dataset_sampling(orig_train_dataset, config):
+    """Run comprehensive dataset debugging"""
+
+    train_dataset = HGCDataset(Dataset.create(**orig_train_dataset), config)
+    
+    print("🔍 STARTING COMPREHENSIVE DATASET VALIDATION")
+    print("This will help identify issues in data sampling...")
+    
+    # 1. Basic validation with visual debugging
+    print("\n🔹 Running basic validation...")
+    train_dataset.debug_sample_and_validate(batch_size=100, num_debug_samples=5)
+    
+    # 2. Edge case testing
+    print("\n🔹 Testing edge cases...")
+    train_dataset.test_edge_cases()
+    
+    # 3. Trajectory consistency validation
+    print("\n🔹 Checking trajectory consistency...")
+    train_dataset.validate_trajectory_consistency(batch_size=50)
+    
+    print("\n✅ Dataset validation complete!")
 
 def main(_):
     # Set up logger.
@@ -56,6 +77,14 @@ def main(_):
     # Set up environment and dataset.
     config = FLAGS.agent
     env, train_dataset, val_dataset = make_env_and_datasets(FLAGS.env_name, frame_stack=config['frame_stack'])
+
+    # # temporary dataset debugging
+    # if config['dataset_class'] == 'HGCDataset':
+    #     debug_dataset_sampling(train_dataset, config)
+    #     exit()
+    # else:
+    #     print("No dataset debugging for this dataset class")
+    #     exit()
 
     dataset_class = {
         'GCDataset': GCDataset,

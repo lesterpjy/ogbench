@@ -636,8 +636,8 @@ def get_config():
             "low_actor_rep_grad": False,
             "subgoal_steps": 25,
             # DDPG+BC parameters
-            "low_alpha": 3.0,  # Weight for Q-term in low-level actor loss
-            "high_alpha": 3.0,  # Weight for Q-term in high-level actor loss
+            "low_alpha": 1.0,  # Weight for Q-term in low-level actor loss
+            "high_alpha": 1.0,  # Weight for Q-term in high-level actor loss
             # static weights
             # "value_loss_weight": 10.0,
             # "critic_loss_weight": 0.2,
