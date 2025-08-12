@@ -8,6 +8,64 @@ import numpy as np
 from flax.core.frozen_dict import FrozenDict
 
 
+def create_trajectory_subset(dataset_dict, num_transitions, seed):
+    """
+    Creates a subset of the dataset by selecting the first K trajectories
+    from a shuffled list to meet or exceed the desired number of transitions.
+
+    Args:
+        dataset_dict: The full dataset as a dictionary of numpy arrays.
+        num_transitions: The target number of transitions for the subset.
+        seed: A random seed for shuffling trajectories to ensure reproducibility.
+
+    Returns:
+        A new dataset dictionary containing the subset of data.
+    """
+    if 'terminals' not in dataset_dict:
+        raise ValueError("Dataset must contain 'terminals' to identify trajectories.")
+
+    print(f"Creating data subset with target of {num_transitions} transitions...")
+
+    # Identify the start and end indices of each trajectory
+    terminal_locs = np.nonzero(dataset_dict['terminals'] > 0)[0]
+    initial_locs = np.concatenate([[0], terminal_locs[:-1] + 1])
+    trajectories = list(zip(initial_locs, terminal_locs))
+
+    # Shuffle trajectories for random subsampling
+    rng = np.random.RandomState(seed)
+    rng.shuffle(trajectories)
+
+    selected_indices = []
+    current_transitions = 0
+    for start, end in trajectories:
+        # The number of transitions in a trajectory is (end - start + 1)
+        num_traj_transitions = end - start + 1
+        
+        selected_indices.extend(range(start, end + 1))
+        current_transitions += num_traj_transitions
+        if current_transitions >= num_transitions:
+            break
+    
+    if current_transitions < num_transitions:
+            print(f"Warning: Requested {num_transitions} transitions, but only found {current_transitions} in the selected trajectories.")
+
+    selected_indices = np.array(selected_indices, dtype=np.int64)
+    
+    subset_dict = {
+        key: arr[selected_indices] for key, arr in dataset_dict.items()
+    }
+
+    # The last 'terminal' flag in the new subset must be 1 for HGCDataset's logic to work.
+    subset_dict['terminals'][-1] = 1.0
+    
+    # If the original dataset was compact, we must also fix the 'valids' array.
+    if 'valids' in subset_dict:
+        subset_dict['valids'] = 1.0 - subset_dict['terminals']
+
+    print(f"Subset created with {current_transitions} actual transitions.")
+    return subset_dict
+
+    
 def get_size(data):
     """Return the size of the dataset."""
     sizes = jax.tree_util.tree_map(lambda arr: len(arr), data)
