@@ -23,6 +23,20 @@ pip install -r requirements.txt
 
 This requires Python 3.9+ and JAX >= 0.4.26.
 
+## Code Structure
+
+All training code is located under the `impls/` directory:
+
+- **`main.py`**: Main training script that orchestrates the entire training pipeline
+- **`agents/hiql_ddpgbc_orig.py`**: Core implementation of the `HIQLDDPGBCOGAgent` class with critic extraction
+- **`dataset.py`**: Dataset loading and processing, including support for data scaling experiments
+- **`agents/hiql.py`**: Original HIQL implementation for reference
+
+The key modification is the `HIQLDDPGBCOGAgent` class, which extends HIQL by:
+1. Extracting high-level and low-level critics from the learned V-function
+2. Enabling DDPG+BC policy extraction using these critics
+3. Supporting both DDPG+BC and AWR policy extraction methods
+
 ## Quick Start
 
 ### Basic Training
@@ -30,6 +44,7 @@ This requires Python 3.9+ and JAX >= 0.4.26.
 Train HIQL-CE with DDPG+BC on visual-cube-single:
 
 ```bash
+cd impls
 python main.py \
   --env_name=visual-cube-single-play-v0 \
   --train_steps=500000 \
@@ -79,7 +94,7 @@ python main.py --env_name=visual-puzzle-3x3-play-v0 \
 
 ### Data Scaling Experiments (Table 2)
 
-Specify dataset sizes for value learning and policy extraction separately:
+The dataset loading mechanism supports separate control over value learning and policy extraction data:
 
 ```bash
 python main.py --env_name=visual-puzzle-3x3-play-v0 \
@@ -93,14 +108,31 @@ python main.py --env_name=visual-puzzle-3x3-play-v0 \
 - Value data: 100k, 300k, or 1M transitions (`--value_data_transitions`)
 - Policy data: 100k, 300k, or 1M transitions (`--policy_data_transitions`)
 
-Run all 9 combinations to reproduce the complete matrix.
+Run all 9 combinations to reproduce the complete matrix. The dataset loader maintains episode structure when creating subsets.
 
 ## Implementation Details
 
-- **Main modification:** `HIQLDDPGBCOGAgent` class in `impls/agents/hiql_ddpgbc_orig.py`
-- **Critic extraction:** High-level and low-level critics are extracted from the learned V-function
-- **Policy extraction:** Supports both DDPG+BC and AWR via `--agent.actor_loss` flag
-- **Evaluation:** Performance averaged over final 3 evaluation epochs (300k, 400k, 500k steps)
+### Critic Extraction Process
+
+The `HIQLDDPGBCOGAgent` implements a three-phase training process:
+
+1. **Value Learning**: Train V(s, g) using action-free IQL (Equation 5 in paper)
+2. **Critic Extraction**: Distill explicit Q-functions from V:
+   - High-level critic Q_h(s, g, z) for subgoal selection
+   - Low-level critic Q_l(s, z, a) for primitive actions
+3. **Policy Extraction**: Extract policies using DDPG+BC or AWR objectives
+
+### Key Files
+
+- **Critic learning**: See `critic_loss()` method in `agents/hiql_ddpgbc_orig.py`
+- **Policy extraction**: See `actor_loss()` method with `actor_loss` parameter
+- **Data scaling**: Modified dataset loading in `dataset.py`
+
+### Evaluation Protocol
+
+- Performance averaged over final 3 evaluation epochs (300k, 400k, 500k steps)
+- 50 rollouts per test-time goal per evaluation
+- Binary success rate reported across 5 predefined challenging goals per task
 
 ## Key Hyperparameters
 
