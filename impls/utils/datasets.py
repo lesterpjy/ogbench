@@ -8,6 +8,80 @@ import numpy as np
 from flax.core.frozen_dict import FrozenDict
 
 
+def create_trajectory_subset(dataset_dict, num_transitions, seed):
+    """
+    Creates a subset of a compact dataset by selecting the first K trajectories
+    from a shuffled list to meet or exceed the desired number of transitions.
+
+    This function correctly handles the special 'terminals' and 'valids' format
+    used by OGBench's compact datasets.
+    """
+    if 'terminals' not in dataset_dict or 'valids' not in dataset_dict:
+        raise ValueError("Compact dataset must contain 'terminals' and 'valids' keys.")
+
+    print(f"\n[DEBUG] Creating compact data subset with target of {num_transitions} transitions...")
+
+    # --- START OF CRITICAL LOGIC ---
+    # In compact datasets, the 'terminals' array is modified. The 'valids' array, however,
+    # preserves the original end-of-trajectory information.
+    # A 'valid' of 0 marks the true last state of a trajectory.
+    # We use this to reconstruct the original terminal flags.
+    original_terminals = 1.0 - dataset_dict['valids']
+
+    # Identify the start and end indices of each trajectory using original boundaries
+    terminal_locs = np.nonzero(original_terminals > 0)[0]
+    initial_locs = np.concatenate([[0], terminal_locs[:-1] + 1])
+    trajectories = list(zip(initial_locs, terminal_locs))
+    print(f"[DEBUG] Found {len(trajectories)} total trajectories using 'valids' array.")
+
+    # Shuffle trajectories for random subsampling
+    rng = np.random.RandomState(seed)
+    rng.shuffle(trajectories)
+
+    selected_indices = []
+    current_transitions = 0
+    for start, end in trajectories:
+        num_traj_transitions = end - start + 1
+        
+        selected_indices.extend(range(start, end + 1))
+        current_transitions += num_traj_transitions
+        if current_transitions >= num_transitions:
+            break
+    
+    if current_transitions < num_transitions:
+        print(f"Warning: Requested {num_transitions}, but only found {current_transitions}.")
+
+    selected_indices = np.array(selected_indices, dtype=np.int64)
+    
+    # Create the initial subset by slicing
+    subset_dict = {
+        key: arr[selected_indices] for key, arr in dataset_dict.items()
+    }
+
+    # --- RE-APPLY COMPACT DATASET FORMATTING ---
+    # The slicing operation has created a new array. We must now ensure its
+    # 'terminals' and 'valids' fields are correctly formatted for HGCDataset.
+
+    # 1. Reconstruct the original terminal flags for the new subset.
+    # The slicing preserves the relative flags, but the final flag must be 1.
+    new_original_terminals = 1.0 - subset_dict['valids']
+    new_original_terminals[-1] = 1.0
+
+    # 2. Re-apply the exact logic from ogbench.utils.load_dataset
+    subset_dict['valids'] = 1.0 - new_original_terminals
+    
+    new_terminals_shifted = np.concatenate([new_original_terminals[1:], [1.0]])
+    subset_dict['terminals'] = np.minimum(new_original_terminals + new_terminals_shifted, 1.0).astype(np.float32)
+
+    # --- FINAL VALIDATION AND LOGGING ---
+    assert subset_dict['terminals'][-1] == 1.0, "Final 'terminal' flag in subset must be 1."
+    assert subset_dict['valids'][-1] == 0.0, "Final 'valid' flag in subset must be 0."
+    num_subset_trajs = np.sum(subset_dict['valids'] == 0)
+
+    print(f"[DEBUG] Subset created with {current_transitions} transitions from {num_subset_trajs} trajectories.")
+    print("[DEBUG] Subsetting successful, compact format re-applied.\n")
+    return subset_dict
+
 def get_size(data):
     """Return the size of the dataset."""
     sizes = jax.tree_util.tree_map(lambda arr: len(arr), data)
@@ -388,6 +462,14 @@ class HGCDataset(GCDataset):
 
         batch['high_actor_goals'] = self.get_observations(high_goal_idxs)
         batch['high_actor_targets'] = self.get_observations(high_target_idxs)
+
+        # All goals for a given index `i` must be within the same trajectory, which
+        # means their indices must be <= the final_state_idx for `i`.
+        assert np.all(low_goal_idxs <= final_state_idxs), "Assertion failed: A low-level goal was sampled from outside its trajectory."
+        assert np.all(high_traj_goal_idxs <= final_state_idxs), "Assertion failed: A high-level trajectory goal was sampled from outside its trajectory."
+        assert np.all(high_traj_target_idxs <= final_state_idxs), "Assertion failed: A high-level trajectory target was sampled from outside its trajectory."
+        # high_random_target_idxs also needs to respect the trajectory boundary of its base state `s_t` (from `idxs`)
+        assert np.all(high_random_target_idxs <= final_state_idxs), "Assertion failed: A high-level random target was sampled from outside its trajectory."
         
         # Compute k-step cumulative discounted rewards for high-level critic
         # This is the sum of discounted rewards from s_t to s_k (where s_k is the high_actor_target)

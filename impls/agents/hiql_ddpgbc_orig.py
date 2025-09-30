@@ -134,7 +134,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
             "value"
         )(batch["high_actor_targets"], batch["high_actor_goals"])
         # Use the minimum for a conservative estimate
-        high_level_v_target = jnp.minimum(high_level_v_target_1, high_level_v_target_2)
+        high_level_v_target = (high_level_v_target_1 + high_level_v_target_2) / 2.0
         
         # Compute the full target: k-step reward + gamma^k * V(s_k, g)
         # Use mask to handle terminal states (when s_k == g)
@@ -181,7 +181,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         low_level_v_target_1, low_level_v_target_2 = self.network.select(
             "value"
         )(batch["next_observations"], batch["low_actor_goals"])
-        low_level_v_target = jnp.minimum(low_level_v_target_1, low_level_v_target_2)
+        low_level_v_target = (low_level_v_target_1 + low_level_v_target_2) / 2.0
         
         # Compute the full target: r(s_t, z_t) + gamma * V(s_{t+1}, z_t)
         # Use mask to handle terminal states (when s_{t+1} == z_t)
@@ -213,138 +213,267 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
 
     def actor_loss(self, batch, grad_params, rng):
         """Phase 3: Extract policies mu_h and mu_l using DDPG+BC objective."""
-        assert not self.config['discrete']
         info = {}
         high_actor_rng, low_actor_rng = jax.random.split(
             rng
         )  # Not used by mode() but good practice
 
-        # --- High-Level Actor Loss: J(mu_h) ---
-        # Get the high-level policy's output (a deterministic subgoal representation).
-        high_actor_dist = self.network.select("high_actor")(
-            batch["observations"], batch["high_actor_goals"], params=grad_params
-        )
-        # for deterministic policy, use the mode of the distribution (mean for a Gaussian)
-        if self.config['const_std']:
-            pred_subgoal_reps = high_actor_dist.mode()
-        else:
-            pred_subgoal_reps = high_actor_dist.sample(seed=high_actor_rng)
-        # Normalize to match the target distribution
-        pred_subgoal_reps = pred_subgoal_reps / jnp.linalg.norm(pred_subgoal_reps, axis=-1, keepdims=True) * jnp.sqrt(pred_subgoal_reps.shape[-1])
-
-        # DDPG component: Maximize the Q-value of the action chosen by the policy.
-        # We evaluate the predicted subgoal representation using the high-level critic.
-        q_h_1, q_h_2 = self.network.select("high_critic")(
-            batch["observations"], batch["high_actor_goals"], pred_subgoal_reps
-        )
-        # Use the minimum of the two critics to get a conservative Q-estimate
-        q_h = jnp.minimum(q_h_1, q_h_2)
-        # Maximizing Q is equivalent to minimizing -Q, normalize to make it scale-invariant
-        high_q_loss = -q_h.mean() / jax.lax.stop_gradient(jnp.abs(q_h).mean() + 1e-6)
-
-        # Behavioral Cloning (BC) component: Regularize the policy to stay close to the dataset "actions".
-        # The target "action" for the high-level policy is the representation of the future state s_k.
-        target_subgoal_reps = self.network.select("goal_rep")(
-            jnp.concatenate(
-                [batch["observations"], batch["high_actor_targets"]], axis=-1
+        if self.config['actor_loss'] == 'ddpgbc':
+            assert not self.config['discrete']
+            # --- High-Level Actor Loss: J(mu_h) ---
+            # Get the high-level policy's output (a deterministic subgoal representation).
+            high_actor_dist = self.network.select("high_actor")(
+                batch["observations"], batch["high_actor_goals"], params=grad_params
             )
-        )
+            # for deterministic policy, use the mode of the distribution (mean for a Gaussian)
+            if self.config['const_std']:
+                pred_subgoal_reps = high_actor_dist.mode()
+            else:
+                pred_subgoal_reps = high_actor_dist.sample(seed=high_actor_rng)
+            # Normalize to match the target distribution
+            pred_subgoal_reps = pred_subgoal_reps / jnp.linalg.norm(pred_subgoal_reps, axis=-1, keepdims=True) * jnp.sqrt(pred_subgoal_reps.shape[-1])
 
-        # We compute MSE between the policy's output and the target representation.
-        # The target is a fixed label, so we stop gradients.
-        high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
-        high_bc_loss = -(self.config['high_alpha'] * high_log_prob).mean()
+            # DDPG component: Maximize the Q-value of the action chosen by the policy.
+            # We evaluate the predicted subgoal representation using the high-level critic.
+            q_h_1, q_h_2 = self.network.select("high_critic")(
+                batch["observations"], batch["high_actor_goals"], pred_subgoal_reps
+            )
+            # Use the minimum of the two critics to get a conservative Q-estimate
+            q_h = jnp.minimum(q_h_1, q_h_2)
+            # Maximizing Q is equivalent to minimizing -Q, normalize to make it scale-invariant
+            high_q_loss = -q_h.mean() / jax.lax.stop_gradient(jnp.abs(q_h).mean() + 1e-6)
 
-        # The final actor loss is a weighted sum of the DDPG and BC components.
-        high_actor_loss = high_q_loss + high_bc_loss
-        info["high_actor_loss"] = high_actor_loss
-        info["high_q_loss"] = high_q_loss
-        info["high_bc_loss"] = high_bc_loss
-        info["high_q_mean"] = q_h.mean()
-        info["high_q_abs_mean"] = jnp.abs(q_h).mean()
-        info["high_q_std"] = jnp.std(q_h)
-        info["high_bc_log_prob"] = high_log_prob.mean()
-        info["high_mse"] = jnp.mean((pred_subgoal_reps - target_subgoal_reps) ** 2)
-        info["high_target_rep_norm"] = jnp.linalg.norm(target_subgoal_reps, axis=-1).mean()
-        info["high_pred_rep_norm"] = jnp.linalg.norm(pred_subgoal_reps, axis=-1).mean()
-        info["high_std"] = jnp.mean(high_actor_dist.scale_diag)
-        
+            # Behavioral Cloning (BC) component: Regularize the policy to stay close to the dataset "actions".
+            # The target "action" for the high-level policy is the representation of the future state s_k.
+            target_subgoal_reps = self.network.select("goal_rep")(
+                jnp.concatenate(
+                    [batch["observations"], batch["high_actor_targets"]], axis=-1
+                )
+            )
 
-        # --- Low-Level Actor Loss: J(mu_l) ---
-        # The logic is identical, but for the low-level policy.
-        # Get the subgoal representation for the low-level policy's context.
-        subgoal_reps_low = self.network.select("goal_rep")(
-            jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
-            params=grad_params,
-        )
-        if not self.config['low_actor_rep_grad']:
-            # Stop gradients through the goal representations.
-            subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
-        # Get the deterministic primitive action from the low-level policy.
-        low_actor_dist = self.network.select("low_actor")(
-            batch["observations"],
-            subgoal_reps_low,
-            goal_encoded=True,
-            params=grad_params,
-        )
-        # pred_actions = low_actor_dist.mode()
-        if self.config['const_std']:
-            pred_actions = low_actor_dist.mode()
-        else:
-            pred_actions = low_actor_dist.sample(seed=low_actor_rng)
+            # We compute MSE between the policy's output and the target representation.
+            # The target is a fixed label, so we stop gradients.
+            high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
+            high_bc_loss = -(self.config['high_alpha'] * high_log_prob).mean()
 
-        if not self.config['discrete']:
-            pred_actions = jnp.clip(pred_actions, -1, 1)
+            # The final actor loss is a weighted sum of the DDPG and BC components.
+            high_actor_loss = high_q_loss + high_bc_loss
+            info["high_actor_loss"] = high_actor_loss
+            info["high_q_loss"] = high_q_loss
+            info["high_bc_loss"] = high_bc_loss
+            info["high_q_mean"] = q_h.mean()
+            info["high_q_abs_mean"] = jnp.abs(q_h).mean()
+            info["high_q_std"] = jnp.std(q_h)
+            info["high_bc_log_prob"] = high_log_prob.mean()
+            info["high_mse"] = jnp.mean((pred_subgoal_reps - target_subgoal_reps) ** 2)
+            info["high_target_rep_norm"] = jnp.linalg.norm(target_subgoal_reps, axis=-1).mean()
+            info["high_pred_rep_norm"] = jnp.linalg.norm(pred_subgoal_reps, axis=-1).mean()
+            info["high_std"] = jnp.mean(high_actor_dist.scale_diag)
 
-        # DDPG component: Evaluate the predicted action with the low-level critic.
-        q_l_1, q_l_2 = self.network.select("low_critic")(
-            batch["observations"], 
-            jax.lax.stop_gradient(subgoal_reps_low),
-            pred_actions,
-            goal_encoded=True
-        )
-        q_l = jnp.minimum(q_l_1, q_l_2)
-        low_q_loss = -q_l.mean() / jax.lax.stop_gradient(jnp.abs(q_l).mean() + 1e-6)
+            # --- Low-Level Actor Loss: J(mu_l) ---
+            # The logic is identical, but for the low-level policy.
+            # Get the subgoal representation for the low-level policy's context.
+            subgoal_reps_low = self.network.select("goal_rep")(
+                jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
+                params=grad_params,
+            )
+            if not self.config['low_actor_rep_grad']:
+                # Stop gradients through the goal representations.
+                subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
+            # Get the deterministic primitive action from the low-level policy.
+            low_actor_dist = self.network.select("low_actor")(
+                batch["observations"],
+                subgoal_reps_low,
+                goal_encoded=True,
+                params=grad_params,
+            )
+            # pred_actions = low_actor_dist.mode()
+            if self.config['const_std']:
+                pred_actions = low_actor_dist.mode()
+            else:
+                pred_actions = low_actor_dist.sample(seed=low_actor_rng)
 
-        # BC component: Regularize towards the primitive actions from the dataset.
-        low_log_prob = low_actor_dist.log_prob(batch["actions"])
-        low_bc_loss = -(self.config['low_alpha'] * low_log_prob).mean()
+            if not self.config['discrete']:
+                pred_actions = jnp.clip(pred_actions, -1, 1)
 
-        # Combine the losses.
-        low_actor_loss = low_q_loss + low_bc_loss
-        info["low_actor_loss"] = low_actor_loss
-        info["low_q_loss"] = low_q_loss
-        info["low_bc_loss"] = low_bc_loss
-        info["low_q_mean"] = q_l.mean()
-        info["low_q_abs_mean"] = jnp.abs(q_l).mean()
-        info["low_q_std"] = jnp.std(q_l)
-        info["low_bc_log_prob"] = low_log_prob.mean()
-        info["low_mse"] = jnp.mean((pred_actions - batch["actions"]) ** 2)
-        info["low_std"] = jnp.mean(low_actor_dist.scale_diag)
+            # DDPG component: Evaluate the predicted action with the low-level critic.
+            q_l_1, q_l_2 = self.network.select("low_critic")(
+                batch["observations"], 
+                jax.lax.stop_gradient(subgoal_reps_low),
+                pred_actions,
+                goal_encoded=True
+            )
+            q_l = jnp.minimum(q_l_1, q_l_2)
+            low_q_loss = -q_l.mean() / jax.lax.stop_gradient(jnp.abs(q_l).mean() + 1e-6)
+
+            # BC component: Regularize towards the primitive actions from the dataset.
+            low_log_prob = low_actor_dist.log_prob(batch["actions"])
+            low_bc_loss = -(self.config['low_alpha'] * low_log_prob).mean()
+
+            # Combine the losses.
+            low_actor_loss = low_q_loss + low_bc_loss
+            info["low_actor_loss"] = low_actor_loss
+            info["low_q_loss"] = low_q_loss
+            info["low_bc_loss"] = low_bc_loss
+            info["low_q_mean"] = q_l.mean()
+            info["low_q_abs_mean"] = jnp.abs(q_l).mean()
+            info["low_q_std"] = jnp.std(q_l)
+            info["low_bc_log_prob"] = low_log_prob.mean()
+            info["low_mse"] = jnp.mean((pred_actions - batch["actions"]) ** 2)
+            info["low_std"] = jnp.mean(low_actor_dist.scale_diag)
+        elif self.config['actor_loss'] == 'awr':
+            # --- High-Level Actor Loss (AWR) ---
+            # Get V(s, g)
+            v_h_1, v_h_2 = self.network.select("value")(batch["observations"], batch["high_actor_goals"])
+            v_h = (v_h_1 + v_h_2) / 2.0
+            
+            # Get target action z_target (subgoal representation from dataset)
+            target_subgoal_reps = self.network.select("goal_rep")(
+                jnp.concatenate([batch["observations"], batch["high_actor_targets"]], axis=-1)
+            )
+
+            # Get Q(s, g, z_target)
+            q_h_1, q_h_2 = self.network.select("high_critic")(
+                batch["observations"], batch["high_actor_goals"], jax.lax.stop_gradient(target_subgoal_reps)
+            )
+            q_h = jnp.minimum(q_h_1, q_h_2)
+
+            # Compute Advantage and Advantage-Weighted Loss
+            adv_h = q_h - v_h
+            exp_a_h = jnp.exp(adv_h * self.config['high_alpha'])
+            exp_a_h = jnp.minimum(exp_a_h, 100.0)
+
+            high_actor_dist = self.network.select("high_actor")(
+                batch["observations"], batch["high_actor_goals"], params=grad_params
+            )
+            high_log_prob = high_actor_dist.log_prob(target_subgoal_reps)
+            high_actor_loss = -(exp_a_h * high_log_prob).mean()
+
+            info["high_actor_loss"] = high_actor_loss
+            info["high_adv"] = adv_h.mean()
+            info["high_bc_log_prob"] = high_log_prob.mean()
+            if not self.config['discrete']:
+                 info["high_mse"] = jnp.mean((high_actor_dist.mode() - target_subgoal_reps) ** 2)
+                 info["high_std"] = jnp.mean(high_actor_dist.scale_diag)
+
+            # --- Low-Level Actor Loss (AWR) ---
+            subgoal_reps_low = self.network.select("goal_rep")(
+                jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
+                params=grad_params,
+            )
+            
+            # Get V(s, z)
+            v_l_1, v_l_2 = self.network.select("value")(batch["observations"], batch["low_actor_goals"])
+            v_l = (v_l_1 + v_l_2) / 2.0
+            
+            # Get Q(s, z, a)
+            q_l_1, q_l_2 = self.network.select("low_critic")(
+                batch["observations"],
+                jax.lax.stop_gradient(subgoal_reps_low),
+                batch["actions"],
+                goal_encoded=True
+            )
+            q_l = jnp.minimum(q_l_1, q_l_2)
+
+            # Compute Advantage and Advantage-Weighted Loss
+            adv_l = q_l - v_l
+            exp_a_l = jnp.exp(adv_l * self.config['low_alpha'])
+            exp_a_l = jnp.minimum(exp_a_l, 100.0)
+            
+            if not self.config['low_actor_rep_grad']:
+                subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
+
+            low_actor_dist = self.network.select("low_actor")(
+                batch["observations"],
+                subgoal_reps_low,
+                goal_encoded=True,
+                params=grad_params
+            )
+            low_log_prob = low_actor_dist.log_prob(batch["actions"])
+            low_actor_loss = -(exp_a_l * low_log_prob).mean()
+
+            info["low_actor_loss"] = low_actor_loss
+            info["low_adv"] = adv_l.mean()
+            info["low_bc_log_prob"] = low_log_prob.mean()
+            if not self.config['discrete']:
+                info["low_mse"] = jnp.mean((low_actor_dist.mode() - batch["actions"]) ** 2)
+                info["low_std"] = jnp.mean(low_actor_dist.scale_diag)
+
+        elif self.config['actor_loss'] == 'sfbc':
+            # SfBC is pure Behavioral Cloning.
+            # --- High-Level Actor Loss (BC) ---
+            target_subgoal_reps = self.network.select("goal_rep")(
+                jnp.concatenate([batch["observations"], batch["high_actor_targets"]], axis=-1)
+            )
+            
+            high_actor_dist = self.network.select("high_actor")(
+                batch["observations"], batch["high_actor_goals"], params=grad_params
+            )
+            high_log_prob = high_actor_dist.log_prob(jax.lax.stop_gradient(target_subgoal_reps))
+            high_actor_loss = -(self.config['high_alpha'] * high_log_prob).mean()
+
+            info["high_actor_loss"] = high_actor_loss
+            info["high_bc_log_prob"] = high_log_prob.mean()
+
+            # --- Low-Level Actor Loss (BC) ---
+            subgoal_reps_low = self.network.select("goal_rep")(
+                jnp.concatenate([batch["observations"], batch["low_actor_goals"]], axis=-1),
+                params=grad_params
+            )
+            if not self.config['low_actor_rep_grad']:
+                subgoal_reps_low = jax.lax.stop_gradient(subgoal_reps_low)
+
+            low_actor_dist = self.network.select("low_actor")(
+                batch["observations"],
+                subgoal_reps_low,
+                goal_encoded=True,
+                params=grad_params
+            )
+            low_log_prob = low_actor_dist.log_prob(batch["actions"])
+            low_actor_loss = -(self.config['low_alpha'] * low_log_prob).mean()
+
+            info["low_actor_loss"] = low_actor_loss
+            info["low_bc_log_prob"] = low_log_prob.mean()
 
         total_actor_loss = high_actor_loss + low_actor_loss
         return total_actor_loss, info
 
     @jax.jit
-    def total_loss(self, batch, grad_params, rng=None, step=None):
+    def total_loss(self, value_batch, policy_batch, grad_params, rng=None, step=None):
         """Compute the total loss by combining all three phases."""
         info = {}
         # Get a new random key for this update step.
         rng = rng if rng is not None else self.rng
         rng, actor_rng = jax.random.split(rng)
 
-        # Compute the loss for Phase 1 (learning V).
-        value_loss, value_info = self.value_loss(batch, grad_params)
+        # # Compute the loss for Phase 1 (learning V).
+        # value_loss, value_info = self.value_loss(batch, grad_params)
+        # for k, v in value_info.items():
+        #     info[f"value/{k}"] = v
+
+        # # Compute the loss for Phase 2 (learning Qs).
+        # critic_loss, critic_info = self.critic_loss(batch, grad_params)
+        # for k, v in critic_info.items():
+        #     info[f"critic/{k}"] = v
+
+        # # Compute the loss for Phase 3 (learning policies).
+        # actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        # for k, v in actor_info.items():
+        #     info[f"actor/{k}"] = v
+
+        # MODIFICATION: Route correct batches to loss functions
+        # Phase 1 (learning V) uses the value dataset
+        value_loss, value_info = self.value_loss(value_batch, grad_params)
         for k, v in value_info.items():
             info[f"value/{k}"] = v
 
-        # Compute the loss for Phase 2 (learning Qs).
-        critic_loss, critic_info = self.critic_loss(batch, grad_params)
+        # Phase 2 (learning Qs) uses the policy dataset
+        critic_loss, critic_info = self.critic_loss(policy_batch, grad_params)
         for k, v in critic_info.items():
             info[f"critic/{k}"] = v
 
-        # Compute the loss for Phase 3 (learning policies).
-        actor_loss, actor_info = self.actor_loss(batch, grad_params, actor_rng)
+        # Phase 3 (learning policies) uses the policy dataset
+        actor_loss, actor_info = self.actor_loss(policy_batch, grad_params, actor_rng)
         for k, v in actor_info.items():
             info[f"actor/{k}"] = v
 
@@ -393,7 +522,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         network.params[f"modules_target_{module_name}"] = new_target_params
 
     @jax.jit
-    def update(self, batch):
+    def update(self, value_batch, policy_batch):
         """
         Performs a single gradient update step for the entire agent.
         """
@@ -404,7 +533,7 @@ class HIQLDDPGBCOGAgent(flax.struct.PyTreeNode):
         # `jax.grad` will differentiate this function with respect to its first argument (`grad_params`).
         step = self.network.step
         def loss_fn(grad_params):
-            return self.total_loss(batch, grad_params, rng=rng, step=step)
+            return self.total_loss(value_batch, policy_batch, grad_params, rng=rng, step=step)
 
         # `apply_loss_fn` is a helper that computes gradients and applies them.
         new_network, info = self.network.apply_loss_fn(loss_fn=loss_fn)
@@ -631,6 +760,7 @@ def get_config():
             "discount": 0.99,
             "tau": 0.005,  # Target network update rate for V-function
             "expectile": 0.7,  # IQL expectile for V-function
+            "actor_loss": 'ddpgbc',  # Actor loss type ('awr' or 'ddpgbc' or 'sfbc')
             # HIQL parameters
             "rep_dim": 10,
             "low_actor_rep_grad": False,
